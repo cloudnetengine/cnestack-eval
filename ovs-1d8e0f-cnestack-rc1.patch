@@ -1,0 +1,400 @@
+From cf0bc1e0c6203402868144f54d70659ef64bd77b Mon Sep 17 00:00:00 2001
+From: Jun Xiao <jun.xiao@cloudnetengine.com>
+Date: Thu, 6 Jan 2022 23:33:37 +0800
+Subject: [PATCH] patch for cnestack
+
+---
+ lib/dp-packet.h         | 39 +++++++++++++++++++++++++++++++++++++++
+ lib/dpif-netdev.c       | 18 ++++++++++++++++++
+ lib/flow.c              | 33 +++++++++++++++++++++++++++++++++
+ lib/netdev-dpdk.c       | 21 +++++++++++++++++++++
+ lib/netdev-provider.h   |  9 +++++++++
+ lib/netdev.h            |  3 +++
+ repack.sh               | 24 ++++++++++++++++++++++++
+ vswitchd/automake.mk    | 13 +++++++++++--
+ vswitchd/ovs-vswitchd.c |  6 ++++++
+ 9 files changed, 164 insertions(+), 2 deletions(-)
+ create mode 100755 repack.sh
+
+diff --git a/lib/dp-packet.h b/lib/dp-packet.h
+index 3dc582fbf..6ba433279 100644
+--- a/lib/dp-packet.h
++++ b/lib/dp-packet.h
+@@ -105,6 +105,34 @@ enum dp_packet_offload_mask {
+ #define DP_PACKET_OL_RX_L4_CKSUM_MASK (DP_PACKET_OL_RX_L4_CKSUM_GOOD | \
+                                        DP_PACKET_OL_RX_L4_CKSUM_BAD)
+ 
++#ifdef CNE_NET
++
++/* We use a dedicated bit to indicate pushed tunnel header,
++ * as it's not accurate to infer this by neither dp_inner_ltypes
++ * nor dp_inner_lxx_ofs. */
++#define CNE_PKT_LAYER_TYPES \
++    PKT_LTYPE(L3, l3,   IPV4,   ipv4,  0)            \
++    PKT_LTYPE(L3, l3,   IPV6,   ipv6,  1)            \
++    PKT_LTYPE(L3, l3,    ARP,    arp,  2)            \
++    PKT_LTYPE(L3, l3,   FRAG,   frag,  3)            \
++    PKT_LTYPE(L4, l4,    TCP,    tcp,  8)            \
++    PKT_LTYPE(L4, l4,    UDP,    udp,  9)            \
++    PKT_LTYPE(L4, l4,   SCTP,   sctp, 10)            \
++    PKT_LTYPE(L4, l4,   ICMP,   icmp, 11)            \
++    PKT_LTYPE(L4, l4, ICMPV6, icmpv6, 12)            \
++    PKT_LTYPE(L4, l4,   IGMP,   igmp, 13)
++
++/* Don't include pushed tunnel header flag. */
++#define CNE_LTYPE_PROTO_MASK    0x7f
++
++enum {
++#define PKT_LTYPE(LAYER, layer, PROTO, proto, index) \
++    CNE_##LAYER##_TYPE_##PROTO = (1u << index),
++    CNE_PKT_LAYER_TYPES
++#undef PKT_LTYPE
++};
++#endif
++
+ /* Buffer for holding packet data.  A dp_packet is automatically reallocated
+  * as necessary if it grows too large for the available memory.
+  * By default the packet type is set to Ethernet (PT_ETH).
+@@ -134,6 +162,17 @@ struct dp_packet {
+                                       or UINT16_MAX. */
+     uint32_t cutlen;               /* length in bytes to cut from the end. */
+     ovs_be32 packet_type;          /* Packet type as defined in OpenFlow */
++#ifdef CNE_NET
++    union {
++        struct {
++          uint16_t dp_ltypes;
++          uint16_t dp_inner_ltypes;
++          uint16_t dp_inner_l3_ofs;
++          uint16_t dp_inner_l4_ofs;
++        };
++        uint64_t layout_md;
++    };
++#endif
+     union {
+         struct pkt_metadata md;
+         uint64_t data[DP_PACKET_CONTEXT_SIZE / 8];
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index d6bee2a5a..d109155af 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -559,6 +559,16 @@ pmd_perf_metrics_enabled(const struct dp_netdev_pmd_thread *pmd);
+ static void queue_netdev_flow_del(struct dp_netdev_pmd_thread *pmd,
+                                   struct dp_netdev_flow *flow);
+ 
++#ifdef CNE_NET
++typedef void thirdparty_run_cb_t(void);
++static thirdparty_run_cb_t *thirdparty_run_cb;
++void dpif_netdev_register_thirdparty_run_cb(thirdparty_run_cb_t *);
++void
++dpif_netdev_register_thirdparty_run_cb(thirdparty_run_cb_t *cb)
++{
++    thirdparty_run_cb = cb;
++}
++#endif
+ /* Updates the time in PMD threads context and should be called in three cases:
+  *
+  *     1. PMD structure initialization:
+@@ -5919,6 +5929,11 @@ dpif_netdev_run(struct dpif *dpif)
+     struct dp_netdev_pmd_thread *pmd;
+ 
+     ovs_mutex_lock(&dp->port_mutex);
++#ifdef CNE_NET
++    if (thirdparty_run_cb) {
++        thirdparty_run_cb();
++    }
++#endif
+     non_pmd = dp_netdev_get_pmd(dp, NON_PMD_CORE_ID);
+     if (non_pmd) {
+         ovs_mutex_lock(&dp->non_pmd_mutex);
+@@ -7361,6 +7376,9 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
+ 
+         if (!md_is_valid) {
+             pkt_metadata_init(&packet->md, port_no);
++#ifdef CNE_NET
++            packet->layout_md = 0;
++#endif
+         }
+ 
+         if (netdev_flow_api && recirc_depth == 0) {
+diff --git a/lib/flow.c b/lib/flow.c
+index 89837de95..7e202eb84 100644
+--- a/lib/flow.c
++++ b/lib/flow.c
+@@ -906,6 +906,12 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+         nw_ttl = nh->ip_ttl;
+         nw_proto = nh->ip_proto;
+         nw_frag = ipv4_get_nw_frag(nh);
++#ifdef CNE_NET
++        packet->dp_ltypes = CNE_L3_TYPE_IPV4;
++        if (OVS_UNLIKELY(nw_frag)) {
++            packet->dp_ltypes |= CNE_L3_TYPE_FRAG;
++        }
++#endif
+         data_pull(&data, &size, ip_len);
+     } else if (dl_type == htons(ETH_TYPE_IPV6)) {
+         const struct ovs_16aligned_ip6_hdr *nh = data;
+@@ -956,6 +962,12 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+         ASSERT_SEQUENTIAL(ipv6_label, nw_frag);
+         ovs_be32 label = tc_flow & htonl(IPV6_LABEL_MASK);
+         miniflow_push_be32(mf, ipv6_label, label);
++#ifdef CNE_NET
++        packet->dp_ltypes = CNE_L3_TYPE_IPV6;
++        if (OVS_UNLIKELY(nw_frag)) {
++            packet->dp_ltypes |= CNE_L3_TYPE_FRAG;
++        }
++#endif
+     } else {
+         if (dl_type == htons(ETH_TYPE_ARP) ||
+             dl_type == htons(ETH_TYPE_RARP)) {
+@@ -985,6 +997,9 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+                 arp_buf[1] = arp->ar_tha;
+                 miniflow_push_macs(mf, arp_sha, arp_buf);
+                 miniflow_pad_to_64(mf, arp_tha);
++#ifdef CNE_NET
++                packet->dp_ltypes = CNE_L3_TYPE_ARP;
++#endif
+             }
+         } else if (dl_type == htons(ETH_TYPE_NSH)) {
+             struct ovs_key_nsh nsh;
+@@ -1014,6 +1029,9 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+                 miniflow_push_be16(mf, tp_dst, tcp->tcp_dst);
+                 miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
+                 miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
++#ifdef CNE_NET
++                packet->dp_ltypes |= CNE_L4_TYPE_TCP;
++#endif
+             }
+         } else if (OVS_LIKELY(nw_proto == IPPROTO_UDP)) {
+             if (OVS_LIKELY(size >= UDP_HEADER_LEN)) {
+@@ -1023,6 +1041,9 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+                 miniflow_push_be16(mf, tp_dst, udp->udp_dst);
+                 miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
+                 miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
++#ifdef CNE_NET
++                packet->dp_ltypes |= CNE_L4_TYPE_UDP;
++#endif
+             }
+         } else if (OVS_LIKELY(nw_proto == IPPROTO_SCTP)) {
+             if (OVS_LIKELY(size >= SCTP_HEADER_LEN)) {
+@@ -1032,6 +1053,9 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+                 miniflow_push_be16(mf, tp_dst, sctp->sctp_dst);
+                 miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
+                 miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
++#ifdef CNE_NET
++                packet->dp_ltypes |= CNE_L4_TYPE_SCTP;
++#endif
+             }
+         } else if (OVS_LIKELY(nw_proto == IPPROTO_ICMP)) {
+             if (OVS_LIKELY(size >= ICMP_HEADER_LEN)) {
+@@ -1041,6 +1065,9 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+                 miniflow_push_be16(mf, tp_dst, htons(icmp->icmp_code));
+                 miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
+                 miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
++#ifdef CNE_NET
++                packet->dp_ltypes |= CNE_L4_TYPE_ICMP;
++#endif
+             }
+         } else if (OVS_LIKELY(nw_proto == IPPROTO_IGMP)) {
+             if (OVS_LIKELY(size >= IGMP_HEADER_LEN)) {
+@@ -1053,6 +1080,9 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+                 miniflow_push_be32(mf, igmp_group_ip4,
+                                    get_16aligned_be32(&igmp->group));
+                 miniflow_pad_to_64(mf, igmp_group_ip4);
++#ifdef CNE_NET
++                packet->dp_ltypes |= CNE_L4_TYPE_IGMP;
++#endif
+             }
+         } else if (OVS_LIKELY(nw_proto == IPPROTO_ICMPV6)) {
+             if (OVS_LIKELY(size >= sizeof(struct icmp6_data_header))) {
+@@ -1102,6 +1132,9 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+                     miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
+                     miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
+                 }
++#ifdef CNE_NET
++                packet->dp_ltypes |= CNE_L4_TYPE_ICMPV6;
++#endif
+             }
+         }
+     }
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index ca92c947a..f8d78678e 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -1557,6 +1557,18 @@ netdev_dpdk_dealloc(struct netdev *netdev)
+     rte_free(dev);
+ }
+ 
++#ifdef CNE_NET
++static struct rte_mempool *
++netdev_dpdk_get_mempool(const struct netdev *netdev)
++{
++    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
++    if (dev->dpdk_mp) {
++      return dev->dpdk_mp->mp;
++    }
++    return NULL;
++}
++#endif
++
+ static void
+ netdev_dpdk_clear_xstats(struct netdev_dpdk *dev)
+ {
+@@ -2165,6 +2177,13 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+ {
+     struct dp_packet *pkt = CONTAINER_OF(mbuf, struct dp_packet, mbuf);
+ 
++#ifdef CNE_NET
++    if (mbuf->ol_flags & PKT_TX_TCP_SEG) {
++        if (mbuf->ol_flags & PKT_TX_IPV4) {
++            mbuf->ol_flags |= PKT_TX_IP_CKSUM;
++        }
++    }
++#else
+     if (mbuf->ol_flags & PKT_TX_L4_MASK) {
+         mbuf->l2_len = (char *)dp_packet_l3(pkt) - (char *)dp_packet_eth(pkt);
+         mbuf->l3_len = (char *)dp_packet_l4(pkt) - (char *)dp_packet_l3(pkt);
+@@ -2189,6 +2208,7 @@ netdev_dpdk_prep_hwol_packet(struct netdev_dpdk *dev, struct rte_mbuf *mbuf)
+             mbuf->ol_flags |= PKT_TX_IP_CKSUM;
+         }
+     }
++#endif
+     return true;
+ }
+ 
+@@ -5412,6 +5432,7 @@ netdev_dpdk_rte_flow_tunnel_item_release(struct netdev *netdev,
+     .is_pmd = true,                                         \
+     .alloc = netdev_dpdk_alloc,                             \
+     .dealloc = netdev_dpdk_dealloc,                         \
++    .get_mempool = netdev_dpdk_get_mempool,                 \
+     .get_config = netdev_dpdk_get_config,                   \
+     .get_numa_id = netdev_dpdk_get_numa_id,                 \
+     .set_etheraddr = netdev_dpdk_set_etheraddr,             \
+diff --git a/lib/netdev-provider.h b/lib/netdev-provider.h
+index b5420947d..505691777 100644
+--- a/lib/netdev-provider.h
++++ b/lib/netdev-provider.h
+@@ -59,6 +59,9 @@ struct netdev {
+      * opening this device, and therefore got assigned to the "system" class */
+     bool auto_classified;
+ 
++#ifdef CNE_NET
++    void *cne_data;
++#endif
+     /* This bitmask of the offloading features enabled by the netdev. */
+     uint64_t ol_flags;
+ 
+@@ -837,6 +840,12 @@ struct netdev_class {
+     /* Get a block_id from the netdev.
+      * Returns the block_id or 0 if none exists for netdev. */
+     uint32_t (*get_block_id)(struct netdev *);
++
++#ifdef CNE_NET
++    /* Get rte_mempool used by the netdev.
++     * Returns NULL if the netdev is non DPDK. */
++    struct rte_mempool *(*get_mempool)(const struct netdev *);
++#endif
+ };
+ 
+ int netdev_register_provider(const struct netdev_class *);
+diff --git a/lib/netdev.h b/lib/netdev.h
+index acf174927..929d3356f 100644
+--- a/lib/netdev.h
++++ b/lib/netdev.h
+@@ -357,6 +357,9 @@ int netdev_get_addrs(const char dev[], struct in6_addr **paddr,
+                      struct in6_addr **pmask, int *n_in6);
+ #endif
+ 
++#ifdef CNE_NET
++struct rte_mempool *netdev_get_mempool(const struct netdev *netdev);
++#endif
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/repack.sh b/repack.sh
+new file mode 100755
+index 000000000..2ac7a90c9
+--- /dev/null
++++ b/repack.sh
+@@ -0,0 +1,24 @@
++#!/bin/bash
++#
++# The purpose of this script is to weaken symbols in libopenvswitch.a
++# so that some symbols in libcnestack.a can be loaded instead of from
++# libopenvswitch.a
++set -e
++
++TARGET_DIR=$(realpath ".")
++
++f="$TARGET_DIR/lib/.libs/libopenvswitchweak.a"
++TMP_DIR=$(mktemp -d)
++cd "$TMP_DIR"
++ar -x "$f"
++
++for o in * ; do objcopy --weaken $o $o; done
++
++# rearchive; use zsh numeric blob qualifier.
++ar cr repackaged.a *.o
++ranlib repackaged.a
++# Backup original
++cp --force --backup=numbered "$f" "$f"
++cp repackaged.a "$f"
++
++rm -r "$TMP_DIR"
+diff --git a/vswitchd/automake.mk b/vswitchd/automake.mk
+index 595d1e46a..c0e97988a 100644
+--- a/vswitchd/automake.mk
++++ b/vswitchd/automake.mk
+@@ -14,8 +14,8 @@ vswitchd_ovs_vswitchd_SOURCES = \
+ vswitchd_ovs_vswitchd_LDADD = \
+ 	ofproto/libofproto.la \
+ 	lib/libsflow.la \
+-	lib/libopenvswitch.la
+-vswitchd_ovs_vswitchd_LDFLAGS = $(AM_LDFLAGS) $(DPDK_vswitchd_LDFLAGS)
++	lib/libopenvswitchweak.la
++vswitchd_ovs_vswitchd_LDFLAGS = $(AM_LDFLAGS) $(DPDK_vswitchd_LDFLAGS) lib/libcnestack.a
+ MAN_ROOTS += vswitchd/ovs-vswitchd.8.in
+ 
+ # vswitch schema and IDL
+@@ -37,6 +37,15 @@ VSWITCH_DOT_DIAGRAM_ARG = --er-diagram=$(VSWITCH_PIC)
+ CLEANFILES += vswitchd/vswitch.gv vswitchd/vswitch.pic
+ endif
+ 
++lib/libopenvswitchweak.la: repack.sh lib/libopenvswitch.la
++	cp lib/libopenvswitch.la lib/libopenvswitchweak.la && \
++	cp lib/.libs/libopenvswitch.a lib/.libs/libopenvswitchweak.a && \
++	sed -i 's/libopenvswitch\.a/libopenvswitchweak\.a/g' lib/libopenvswitchweak.la && \
++	./repack.sh
++
++CLEANFILES += lib/libopenvswitchweak.la lib/.libs/libopenvswitchweak.a
++EXTRA_DIST += ./repack.sh
++
+ # vswitch schema documentation
+ EXTRA_DIST += vswitchd/vswitch.xml
+ CLEANFILES += vswitchd/ovs-vswitchd.conf.db.5
+diff --git a/vswitchd/ovs-vswitchd.c b/vswitchd/ovs-vswitchd.c
+index f007f9c0b..b00e38503 100644
+--- a/vswitchd/ovs-vswitchd.c
++++ b/vswitchd/ovs-vswitchd.c
+@@ -69,6 +69,9 @@ struct ovs_vswitchd_exit_args {
+     bool *cleanup;
+ };
+ 
++#ifdef CNE_NET
++extern void cnestack_init(void);
++#endif
+ int
+ main(int argc, char *argv[])
+ {
+@@ -112,6 +115,9 @@ main(int argc, char *argv[])
+     bridge_init(remote);
+     free(remote);
+ 
++#ifdef CNE_NET
++    cnestack_init();
++#endif
+     exiting = false;
+     cleanup = false;
+     while (!exiting) {
+-- 
+2.25.1
+
